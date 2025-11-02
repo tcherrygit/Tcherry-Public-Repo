@@ -1,0 +1,316 @@
+#!/bin/bash
+# FOG SERVER SETUP on Ubuntu - Combined Script with Unattended Installation
+# This script sets up a FOG server with DHCP proxy using dnsmasq and performs unattended installation
+# Supports single or dual hard drive configuration
+
+# Exit on any error
+set -e
+
+# Default values
+DEFAULT_HOSTNAME="fog-server.home.local"
+DEFAULT_IP="10.0.0.15"
+DEFAULT_ROUTER="10.0.0.1"
+DEFAULT_FOG_USER="fog"
+DEFAULT_FOG_PASSWORD="password"
+DEFAULT_STORAGE_PATH="/images"
+
+# Function to display status messages
+function echo_status() {
+    echo "==== $1 ===="
+}
+
+# Get variables from user input with defaults
+echo_status "FOG Server Setup - Configuration"
+read -p "Enter FOG server hostname (default: $DEFAULT_HOSTNAME): " FOG_HOSTNAME
+read -p "Enter FOG server IP address (default: $DEFAULT_IP): " FOG_IP
+read -p "Enter network router/gateway IP (default: $DEFAULT_ROUTER): " ROUTER_IP
+read -p "Enter FOG web interface username (default: $DEFAULT_FOG_USER): " FOG_USER
+read -p "Enter FOG password (default: $DEFAULT_FOG_PASSWORD): " FOG_PASSWORD
+
+# Use defaults if no input provided
+FOG_HOSTNAME=${FOG_HOSTNAME:-$DEFAULT_HOSTNAME}
+FOG_IP=${FOG_IP:-$DEFAULT_IP}
+ROUTER_IP=${ROUTER_IP:-$DEFAULT_ROUTER}
+FOG_USER=${FOG_USER:-$DEFAULT_FOG_USER}
+FOG_PASSWORD=${FOG_PASSWORD:-$DEFAULT_FOG_PASSWORD}
+
+echo "Using hostname: $FOG_HOSTNAME"
+echo "Using IP address: $FOG_IP"
+echo "Using router/gateway: $ROUTER_IP"
+echo "Web interface username: $FOG_USER"
+
+# Validate IP address format
+if ! [[ $FOG_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Error: Invalid IP address format for FOG IP. Please use format like 10.0.0.75"
+    exit 1
+fi
+
+if ! [[ $ROUTER_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Error: Invalid IP address format for router. Please use format like 10.0.0.1"
+    exit 1
+fi
+
+# ASK ABOUT STORAGE CONFIGURATION
+echo ""
+echo_status "Storage Configuration"
+echo "Choose your storage setup:"
+echo "  1 - Use primary hard drive only (storage in /images on main drive)"
+echo "  2 - Use a second dedicated hard drive for storage"
+echo ""
+read -p "Enter your choice (1 or 2): " STORAGE_CHOICE
+
+# Validate choice
+if [[ "$STORAGE_CHOICE" != "1" && "$STORAGE_CHOICE" != "2" ]]; then
+    echo "Error: Invalid choice. Please enter 1 or 2"
+    exit 1
+fi
+
+# STORAGE SETUP BASED ON CHOICE
+if [ "$STORAGE_CHOICE" == "2" ]; then
+    # TWO-DRIVE SETUP
+    echo_status "Second Hard Drive Setup Selected"
+    echo "Detecting available storage drives..."
+    echo ""
+    lsblk -d -n -o NAME,SIZE,TYPE | grep disk
+    
+    echo ""
+    echo "Please identify your second hard drive from the list above."
+    echo "Common names: sdb, sdc, nvme1n1, vdb, etc."
+    read -p "Enter the device name for the second hard drive (e.g., sdb): " STORAGE_DEVICE
+    
+    # Validate device exists
+    if [ ! -b "/dev/$STORAGE_DEVICE" ]; then
+        echo "Error: Device /dev/$STORAGE_DEVICE does not exist!"
+        exit 1
+    fi
+    
+    # Warning about data loss
+    echo ""
+    echo "WARNING: All data on /dev/$STORAGE_DEVICE will be DESTROYED!"
+    lsblk /dev/$STORAGE_DEVICE
+    echo ""
+    read -p "Are you absolutely sure you want to use /dev/$STORAGE_DEVICE? (yes/no): " CONFIRM
+    
+    if [ "$CONFIRM" != "yes" ]; then
+        echo "Operation cancelled."
+        exit 1
+    fi
+    
+    # Partition the drive
+    echo_status "Partitioning /dev/$STORAGE_DEVICE"
+    sudo parted /dev/$STORAGE_DEVICE --script mklabel gpt
+    sudo parted /dev/$STORAGE_DEVICE --script mkpart primary ext4 0% 100%
+    
+    # Determine the partition name
+    if [[ $STORAGE_DEVICE =~ nvme ]]; then
+        PARTITION="/dev/${STORAGE_DEVICE}p1"
+    else
+        PARTITION="/dev/${STORAGE_DEVICE}1"
+    fi
+    
+    # Wait for partition to be recognized
+    sleep 2
+    
+    # Format the partition
+    echo_status "Formatting $PARTITION as ext4"
+    sudo mkfs.ext4 -F $PARTITION
+    
+    # Get UUID of the new partition
+    PARTITION_UUID=$(sudo blkid -s UUID -o value $PARTITION)
+    echo "Partition UUID: $PARTITION_UUID"
+    
+    # Create mount point
+    echo_status "Creating mount point at $DEFAULT_STORAGE_PATH"
+    sudo mkdir -p $DEFAULT_STORAGE_PATH
+    
+    # Mount the partition
+    echo_status "Mounting $PARTITION to $DEFAULT_STORAGE_PATH"
+    sudo mount $PARTITION $DEFAULT_STORAGE_PATH
+    
+    # Add to fstab for persistence
+    echo_status "Adding entry to /etc/fstab"
+    sudo cp /etc/fstab /etc/fstab.bak
+    echo "UUID=$PARTITION_UUID $DEFAULT_STORAGE_PATH ext4 defaults 0 2" | sudo tee -a /etc/fstab
+    
+    # Verify mount
+    if mountpoint -q $DEFAULT_STORAGE_PATH; then
+        echo "Successfully mounted $PARTITION to $DEFAULT_STORAGE_PATH"
+    else
+        echo "Error: Failed to mount partition"
+        exit 1
+    fi
+    
+    STORAGE_INFO="Second HDD: /dev/$STORAGE_DEVICE ($PARTITION)"
+    
+else
+    # SINGLE-DRIVE SETUP
+    echo_status "Single Hard Drive Setup Selected"
+    echo "Storage will be located at $DEFAULT_STORAGE_PATH on primary drive"
+    
+    # Create storage directory on primary drive
+    echo_status "Creating storage directory at $DEFAULT_STORAGE_PATH"
+    sudo mkdir -p $DEFAULT_STORAGE_PATH
+    
+    STORAGE_INFO="Primary drive: $DEFAULT_STORAGE_PATH"
+fi
+
+# Set initial open permissions on storage directory (FOG will fix these later)
+echo_status "Setting initial permissions on storage directory"
+sudo chmod 777 $DEFAULT_STORAGE_PATH
+
+# Update your system
+echo_status "Updating system packages"
+sudo apt update && sudo apt-get -y upgrade
+
+# Update the hostname and hosts file
+echo_status "Setting hostname to $FOG_HOSTNAME"
+sudo hostnamectl set-hostname $FOG_HOSTNAME
+
+# Update hosts file
+echo_status "Updating /etc/hosts file"
+sudo cp /etc/hosts /etc/hosts.bak
+sudo grep -v "$FOG_HOSTNAME" /etc/hosts > /tmp/hosts.new || true
+echo "127.0.0.1 $FOG_HOSTNAME" >> /tmp/hosts.new
+echo "$FOG_IP $FOG_HOSTNAME" >> /tmp/hosts.new
+sudo mv /tmp/hosts.new /etc/hosts
+
+# Install git
+echo_status "Installing git"
+sudo apt-get -y install git
+
+# Update the system again
+sudo apt update
+
+# SETUP OF DHCP PROXY
+echo_status "Installing and configuring dnsmasq for DHCP proxy"
+sudo apt-get -y install dnsmasq
+
+# Configure dnsmasq
+echo_status "Configuring dnsmasq"
+sudo tee /etc/dnsmasq.d/ltsp.conf > /dev/null <<EOF
+port=0
+log-dhcp
+tftp-root=/tftpboot
+dhcp-vendorclass=BIOS,PXEClient:Arch:00000
+dhcp-vendorclass=UEFI32,PXEClient:Arch:00006
+dhcp-vendorclass=UEFI,PXEClient:Arch:00007
+dhcp-vendorclass=UEFI64,PXEClient:Arch:00009
+dhcp-boot=net:UEFI32,i386-efi/ipxe.efi,,$FOG_IP
+dhcp-boot=net:UEFI,ipxe.efi,,$FOG_IP
+dhcp-boot=net:UEFI64,ipxe.efi,,$FOG_IP
+dhcp-boot=undionly.kpxe,,$FOG_IP
+dhcp-no-override
+pxe-prompt="Press F8 for boot menu", 0
+pxe-service=X86PC, "Boot from network", undionly
+pxe-service=X86-64_EFI, "Boot to FOG UEFI", ipxe.efi
+pxe-service=BC_EFI, "Boot to FOG UEFI PXE-BC", ipxe.efi
+dhcp-range=$FOG_IP,proxy
+EOF
+
+# Create /tftpboot directory if it doesn't exist
+sudo mkdir -p /tftpboot
+
+# Restart the Dnsmasq service
+echo_status "Restarting dnsmasq service"
+sudo service dnsmasq restart
+
+# FOG INSTALLATION AND SETUP
+echo_status "Downloading the FOG Project from GitHub (dev-branch)"
+sudo git clone https://github.com/fogproject/fogproject.git /opt/fogproject-dev-branch
+
+# Detect primary network interface
+MAIN_INTERFACE=$(ip route | grep default | awk '{print $5}')
+echo "Detected main network interface: $MAIN_INTERFACE"
+
+# Create the unattended installation settings file
+echo_status "Creating unattended installation settings"
+sudo tee /opt/fogproject-dev-branch/bin/.fogsettings > /dev/null <<EOL
+storageLocation="$DEFAULT_STORAGE_PATH"
+storageLocationCapture="\${storageLocation}/dev"
+webroot="/var/www/html/fog"
+webuser="www-data"
+webgroup="www-data"
+tftprootdir="/tftpboot"
+dnsbootimage="N"
+installlang="0"
+packages="apache2 php php-ldap php-gd php-sqlite3 php-curl mysql-server mysql-client php-mysql nfs-kernel-server vsftpd tftpd-hpa wget curl sysv-rc-conf net-tools tar lsb-release xinetd gcc make debconf debconf-utils"
+snmysqluser="root"
+snmysqlpass=""
+snmysqlhost="localhost"
+snmysqldb="fog"
+hostname="$FOG_HOSTNAME"
+fogsettings="N"
+interface="$MAIN_INTERFACE"
+ipaddress="$FOG_IP"
+subnet="255.255.255.0"
+routeraddress="$ROUTER_IP"
+plainrouter="$ROUTER_IP"
+username="fogproject"
+password="$FOG_PASSWORD"
+version="master"
+language="en_US.UTF-8"
+zonetab="/usr/share/zoneinfo/America/New_York"
+EOL
+
+# Run the installer in unattended mode
+echo_status "Starting FOG unattended installation"
+cd /opt/fogproject-dev-branch/bin
+sudo ./installfog.sh -y
+
+# Post-installation: Verify and fix permissions
+echo_status "Verifying storage directory permissions"
+if id "fogproject" > /dev/null 2>&1; then
+    sudo chown -R fogproject:www-data $DEFAULT_STORAGE_PATH
+    sudo chmod -R 775 $DEFAULT_STORAGE_PATH
+    echo "Storage permissions set: fogproject:www-data with 775"
+else
+    echo "Warning: fogproject user not found"
+fi
+
+# Restart services to ensure everything is running
+echo_status "Restarting services"
+sudo systemctl restart vsftpd 2>/dev/null || true
+sudo systemctl restart apache2 2>/dev/null || true
+
+echo_status "FOG Server installation process complete"
+echo ""
+echo "========================================="
+echo "Storage Configuration:"
+echo "========================================="
+if [ "$STORAGE_CHOICE" == "2" ]; then
+    echo "  Configuration: Two Hard Drives"
+    echo "  Device: /dev/$STORAGE_DEVICE"
+    echo "  Partition: $PARTITION"
+    echo "  Mount Point: $DEFAULT_STORAGE_PATH"
+    echo "  UUID: $PARTITION_UUID"
+else
+    echo "  Configuration: Single Hard Drive"
+    echo "  Storage Path: $DEFAULT_STORAGE_PATH"
+    echo "  Located on primary system drive"
+fi
+echo ""
+df -h $DEFAULT_STORAGE_PATH
+echo ""
+echo "========================================="
+echo "FOG Web Interface Access:"
+echo "========================================="
+echo "  URL: http://$FOG_IP/fog/management"
+echo "  Alternative: http://$FOG_HOSTNAME/fog/management"
+echo ""
+echo "Web Interface Login:"
+echo "  Username: $FOG_USER"
+echo "  Password: $FOG_PASSWORD"
+echo ""
+echo "System User (FTP/Storage - created by FOG):"
+echo "  Username: fogproject"
+echo "  Password: (auto-generated by FOG)"
+echo ""
+echo "========================================="
+echo "Next Steps:"
+echo "========================================="
+echo "1. Open a web browser and navigate to the URL above"
+echo "2. Complete the database schema installation if prompted"
+echo "3. Login with the web interface credentials above"
+echo "4. Verify storage node settings in FOG web interface"
+echo "5. Start capturing and deploying images!"
+echo ""
