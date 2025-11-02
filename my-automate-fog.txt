@@ -6,7 +6,7 @@
 # Exit on any error
 set -e
 
-# Default values
+# Default values. Replace those values to match your configuration
 DEFAULT_HOSTNAME="fog-server.home.local"
 DEFAULT_IP="10.0.0.15"
 DEFAULT_ROUTER="10.0.0.1"
