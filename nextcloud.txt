@@ -1,0 +1,439 @@
+#!/bin/bash
+
+# Nextcloud Notes Installation Script for Ubuntu 25.10
+# This script will automate the entire Nextcloud Notes installation process
+
+# Exit on error
+set -e
+
+# Check if script is run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run this script as root or with sudo"
+  exit 1
+fi
+
+# Variables - configured for your network
+HOSTNAME="nextcloud.home.local"
+SERVER_IP="192.168.1.71"
+DB_NAME="nextcloud"
+DB_USER="nextcloud"
+DB_PASSWORD="@Nextcloud2000@"  # Consider changing this for security
+ADMIN_USER="admin"        # Nextcloud admin username
+ADMIN_PASSWORD="@Admin2013@"    # Nextcloud admin password (change this)
+NEXTCLOUD_URL="https://download.nextcloud.com/server/releases/latest.zip"
+
+echo "===== Starting Nextcloud Notes Installation ====="
+echo "This script will install Nextcloud on Ubuntu 25.10"
+echo "Hostname: $HOSTNAME"
+echo "Server IP: $SERVER_IP"
+echo "Database: $DB_NAME"
+echo "DB User: $DB_USER"
+echo "====================================================="
+echo ""
+
+# 1. Setup hostname
+echo "Setting up hostname..."
+echo "$HOSTNAME" > /etc/hostname
+sed -i "s/127.0.1.1.*/127.0.1.1 $HOSTNAME/" /etc/hosts
+# Also add the server IP to hosts file
+if ! grep -q "$SERVER_IP.*$HOSTNAME" /etc/hosts; then
+    echo "$SERVER_IP $HOSTNAME" >> /etc/hosts
+fi
+echo "Hostname configured as $HOSTNAME"
+
+# 2. Install basic utilities and update system
+echo "Installing utilities and updating system..."
+apt -y install tmux wget
+apt update && apt -y dist-upgrade
+echo "System updated successfully"
+
+# 3. Download Nextcloud
+if [ -f "latest.zip" ]; then
+    echo "Nextcloud zip file already exists, skipping download..."
+else
+    echo "Downloading Nextcloud..."
+    wget $NEXTCLOUD_URL -O latest.zip
+    echo "Nextcloud downloaded successfully"
+fi
+
+# 4. Install MariaDB server
+echo "Installing MariaDB server..."
+apt -y install mariadb-server
+
+# Check if MariaDB is already running
+if systemctl is-active --quiet mariadb; then
+    echo "MariaDB is already running"
+else
+    echo "Starting MariaDB..."
+    systemctl enable mariadb
+    systemctl start mariadb
+fi
+
+# Give MariaDB time to fully start
+sleep 2
+echo "MariaDB installed successfully"
+
+# 5. Check MariaDB connection and handle existing installations
+echo "Checking MariaDB connection..."
+if mariadb -e "SELECT 1;" >/dev/null 2>&1; then
+    echo "MariaDB connection successful"
+    
+    # Check if database already exists
+    if mariadb -e "USE $DB_NAME;" >/dev/null 2>&1; then
+        echo "Database '$DB_NAME' already exists. Skipping database creation."
+        echo "If you want to start fresh, drop the database manually first."
+    else
+        echo "Creating Nextcloud database..."
+        mariadb <<MYSQL_SCRIPT
+CREATE DATABASE $DB_NAME;
+GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
+FLUSH PRIVILEGES;
+MYSQL_SCRIPT
+        echo "Database created successfully"
+    fi
+    
+    # Run security hardening
+    echo "Applying security hardening..."
+    mariadb -e "DELETE FROM mysql.user WHERE User='';" 2>/dev/null || true
+    mariadb -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');" 2>/dev/null || true
+    mariadb -e "DROP DATABASE IF EXISTS test;" 2>/dev/null || true
+    mariadb -e "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';" 2>/dev/null || true
+    mariadb -e "FLUSH PRIVILEGES;" 2>/dev/null || true
+    echo "MariaDB secured successfully"
+else
+    echo "ERROR: Cannot connect to MariaDB!"
+    echo ""
+    echo "MariaDB appears to have a root password set from a previous installation."
+    echo "Please run the password reset script first:"
+    echo ""
+    echo "  sudo ./reset_mariadb_password.sh"
+    echo ""
+    echo "Then run this installation script again."
+    exit 1
+fi
+
+# 6. Install Apache and PHP dependencies
+echo "Installing Apache and PHP dependencies..."
+apt-get update
+apt -y install apache2 php php-apcu php-bcmath php-common php-cli php-curl php-gmp php-gd php-imagick php-intl php-mbstring php-mysql php-zip php-xml
+
+# If there are errors, try with --fix-missing
+if [ $? -ne 0 ]; then
+    echo "Retrying installation with --fix-missing option..."
+    apt -y install apache2 php php-apcu php-bcmath php-common php-cli php-curl php-gmp php-gd php-imagick php-intl php-mbstring php-mysql php-zip php-xml --fix-missing
+fi
+echo "Apache and PHP installed successfully"
+
+# 7. Enable PHP modules
+echo "Enabling required PHP modules..."
+phpenmod bcmath gmp imagick intl
+echo "PHP modules enabled successfully"
+
+# 8. Install unzip and extract Nextcloud
+echo "Installing unzip and extracting Nextcloud..."
+apt -y install unzip
+unzip -q latest.zip
+echo "Nextcloud extracted successfully"
+
+# 9. Rename and move the Nextcloud folder
+echo "Renaming and moving Nextcloud folder..."
+mv nextcloud $HOSTNAME
+chown -R www-data:www-data $HOSTNAME/
+mv $HOSTNAME/ /var/www/
+echo "Nextcloud folder moved to /var/www/$HOSTNAME"
+
+# 10. Disable default site
+echo "Disabling default Apache site..."
+a2dissite 000-default.conf
+systemctl reload apache2
+echo "Default site disabled"
+
+# 11. Create Apache site configuration
+echo "Creating Apache configuration file for Nextcloud..."
+cat > /etc/apache2/sites-available/$HOSTNAME.conf <<EOF
+<VirtualHost *:80>
+        DocumentRoot "/var/www/$HOSTNAME"
+        ServerName  $HOSTNAME
+        ServerAlias $SERVER_IP
+        Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains"
+
+        <Directory "/var/www/$HOSTNAME/">
+            Options Multiviews FollowSymLinks
+            AllowOverride All
+            Order allow,deny
+            Allow from All
+        </Directory>
+
+        ErrorLog /var/log/apache2/$HOSTNAME_error.log
+        TransferLog /var/log/apache2/$HOSTNAME_access.log
+</VirtualHost>
+EOF
+echo "Apache configuration created"
+
+# 12. Enable the site
+echo "Enabling Nextcloud site..."
+a2ensite $HOSTNAME.conf
+echo "Nextcloud site enabled"
+
+# 13. Configure PHP settings
+echo "Configuring PHP settings..."
+# Detect PHP version now that it's installed
+PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+echo "PHP Version detected: $PHP_VERSION"
+php_ini_path="/etc/php/$PHP_VERSION/apache2/php.ini"
+# Create backup of original php.ini
+cp $php_ini_path $php_ini_path.bak
+
+# Update PHP settings
+sed -i 's/memory_limit = .*/memory_limit = 512M/' $php_ini_path
+sed -i 's/upload_max_filesize = .*/upload_max_filesize = 200M/' $php_ini_path
+sed -i 's/post_max_size = .*/post_max_size = 200M/' $php_ini_path
+sed -i 's/max_execution_time = .*/max_execution_time = 360/' $php_ini_path
+sed -i 's/display_errors = .*/display_errors = Off/' $php_ini_path
+sed -i 's/display_startup_errors = .*/display_startup_errors = Off/' $php_ini_path
+sed -i 's/log_errors = .*/log_errors = On/' $php_ini_path
+sed -i 's/expose_php = .*/expose_php = Off/' $php_ini_path
+
+# First remove any commented version of the setting (starting with semicolon)
+sed -i 's/;opcache.interned_strings_buffer.*/opcache.interned_strings_buffer=20/' $php_ini_path
+
+# If the setting doesn't exist at all (not even commented), add it
+if ! grep -q "opcache.interned_strings_buffer" $php_ini_path; then
+    echo "opcache.interned_strings_buffer=20" >> $php_ini_path
+fi
+echo "PHP configured successfully"
+
+# 14. Enable Apache modules
+echo "Enabling Apache modules..."
+a2enmod dir env headers mime rewrite ssl
+echo "Apache modules enabled"
+
+# 15. Restart Apache
+echo "Restarting Apache..."
+systemctl restart apache2
+echo "Apache restarted"
+
+# 16. Set up Nextcloud via command line (alternative to web setup)
+echo "Setting up Nextcloud via command line..."
+cd /var/www/$HOSTNAME
+
+# Create and prepare data directory with proper permissions
+echo "Preparing data directory..."
+mkdir -p /var/www/$HOSTNAME/data
+echo "# Nextcloud data directory" > /var/www/$HOSTNAME/data/.ncdata
+chown -R www-data:www-data /var/www/$HOSTNAME
+
+# Run Nextcloud installation
+sudo -u www-data php occ maintenance:install \
+  --database "mysql" \
+  --database-name "$DB_NAME" \
+  --database-user "$DB_USER" \
+  --database-pass "$DB_PASSWORD" \
+  --admin-user "$ADMIN_USER" \
+  --admin-pass "$ADMIN_PASSWORD" \
+  --data-dir "/var/www/$HOSTNAME/data"
+
+# 17. Configure trusted domains
+echo "Configuring trusted domains..."
+sudo -u www-data php occ config:system:set trusted_domains 0 --value="localhost"
+sudo -u www-data php occ config:system:set trusted_domains 1 --value="$HOSTNAME"
+sudo -u www-data php occ config:system:set trusted_domains 2 --value="$SERVER_IP"
+
+echo "Trusted domains configured:"
+echo "  [0] localhost"
+echo "  [1] $HOSTNAME"
+echo "  [2] $SERVER_IP"
+
+# 18. Enable memory cache
+echo "Enabling APCu memory cache..."
+sudo -u www-data php occ config:system:set memcache.local --value='\OC\Memcache\APCu'
+
+# 19. Fix permissions for config.php
+echo "Fixing permissions for config.php..."
+# First ensure www-data can write to it
+chown www-data:www-data /var/www/$HOSTNAME/config/config.php
+# Then after all configurations are done, set to root:www-data
+chmod 660 /var/www/$HOSTNAME/config/config.php
+chown root:www-data /var/www/$HOSTNAME/config/config.php
+
+# 20. Ask about SSL setup
+echo ""
+echo "Do you want to set up SSL with Let's Encrypt? (y/n)"
+echo "NOTE: For SSL to work, $HOSTNAME must be:"
+echo "  1. Registered in your DNS server pointing to $SERVER_IP"
+echo "  2. Accessible from the internet (for Let's Encrypt validation)"
+read -r ssl_choice
+
+if [[ "$ssl_choice" =~ ^[Yy]$ ]]; then
+    echo "Installing Certbot for Apache..."
+    apt -y install python3-certbot-apache
+    
+    echo "Requesting SSL certificate for $HOSTNAME..."
+    certbot --apache -d $HOSTNAME
+    
+    echo "Restarting Apache..."
+    systemctl restart apache2
+    
+    echo "SSL certificate installed successfully!"
+else
+    echo "Skipping SSL setup."
+fi
+
+# 21. Final permissions check
+echo "Performing final permissions check..."
+find /var/www/$HOSTNAME/ -type f -print0 | xargs -0 chmod 0640
+find /var/www/$HOSTNAME/ -type d -print0 | xargs -0 chmod 0750
+chown -R www-data:www-data /var/www/$HOSTNAME/
+echo "Permissions set successfully"
+
+# 22. Additional Nextcloud optimizations
+echo "Applying additional Nextcloud optimizations..."
+sudo chown -R www-data:www-data /var/www/$HOSTNAME/config/
+sudo chmod 770 /var/www/$HOSTNAME/config/
+sudo chmod 660 /var/www/$HOSTNAME/config/config.php
+sudo -u www-data php /var/www/$HOSTNAME/occ maintenance:repair --include-expensive
+
+sudo -u www-data php /var/www/$HOSTNAME/occ config:system:set maintenance_window_start --value="2"
+sudo -u www-data php /var/www/$HOSTNAME/occ background:cron
+
+# Set up cron job for background tasks
+echo "Setting up cron job for Nextcloud background tasks..."
+(crontab -u www-data -l 2>/dev/null; echo "*/5 * * * * php -f /var/www/$HOSTNAME/cron.php") | crontab -u www-data -
+echo "Cron job configured to run every 5 minutes"
+
+# Transactional File Locking with Memcache
+sudo -u www-data php /var/www/$HOSTNAME/occ config:system:set filelocking.enabled --value="true"
+sudo -u www-data php /var/www/$HOSTNAME/occ config:system:set memcache.locking --value='\OC\Memcache\APCu'
+
+# Default Phone Region
+sudo -u www-data php /var/www/$HOSTNAME/occ config:system:set default_phone_region --value="US"
+
+# Imagick SVG Support
+echo "Installing and configuring Imagick SVG support..."
+sudo apt update
+
+# Ubuntu 24.04 uses ImageMagick 7, older versions use ImageMagick 6
+echo "Detecting ImageMagick version..."
+IMAGEMAGICK_PACKAGE=""
+
+# Try ImageMagick 7 packages (Ubuntu 24.04)
+if apt-cache show imagemagick-7.q16hdri >/dev/null 2>&1; then
+    IMAGEMAGICK_PACKAGE="imagemagick-7.q16hdri"
+    echo "Found ImageMagick 7 HDRI"
+elif apt-cache show imagemagick-7.q16 >/dev/null 2>&1; then
+    IMAGEMAGICK_PACKAGE="imagemagick-7.q16"
+    echo "Found ImageMagick 7"
+# Try ImageMagick 6 packages (older Ubuntu versions)
+elif apt-cache show libmagickcore-6.q16hdri-7-extra >/dev/null 2>&1; then
+    IMAGEMAGICK_PACKAGE="libmagickcore-6.q16hdri-7-extra imagemagick"
+    echo "Found ImageMagick 6 HDRI"
+elif apt-cache show libmagickcore-6.q16-7-extra >/dev/null 2>&1; then
+    IMAGEMAGICK_PACKAGE="libmagickcore-6.q16-7-extra imagemagick"
+    echo "Found ImageMagick 6"
+elif apt-cache show libmagickcore-6.q16hdri-6-extra >/dev/null 2>&1; then
+    IMAGEMAGICK_PACKAGE="libmagickcore-6.q16hdri-6-extra imagemagick"
+    echo "Found ImageMagick 6 HDRI (older)"
+elif apt-cache show libmagickcore-6.q16-6-extra >/dev/null 2>&1; then
+    IMAGEMAGICK_PACKAGE="libmagickcore-6.q16-6-extra imagemagick"
+    echo "Found ImageMagick 6 (older)"
+else
+    echo "Warning: Could not find ImageMagick packages. Installing base imagemagick..."
+    IMAGEMAGICK_PACKAGE="imagemagick"
+fi
+
+if [ ! -z "$IMAGEMAGICK_PACKAGE" ]; then
+    echo "Installing $IMAGEMAGICK_PACKAGE..."
+    sudo apt -y install $IMAGEMAGICK_PACKAGE
+    echo "ImageMagick installed"
+fi
+
+# Install librsvg2-bin for SVG rendering
+echo "Installing librsvg2-bin for SVG rendering..."
+sudo apt -y install librsvg2-bin
+
+# Check and fix ImageMagick policy for SVG (both version 6 and 7)
+for POLICY_FILE in "/etc/ImageMagick-6/policy.xml" "/etc/ImageMagick-7/policy.xml"; do
+    if [ -f "$POLICY_FILE" ]; then
+        if grep -q 'pattern="SVG".*rights="none"' "$POLICY_FILE"; then
+            echo "Enabling SVG support in $POLICY_FILE..."
+            cp "$POLICY_FILE" "$POLICY_FILE.backup.$(date +%Y%m%d)"
+            sed -i 's/\(.*pattern="SVG".*rights="\)none\(".*\)/\1read|write\2/' "$POLICY_FILE"
+            echo "SVG support enabled"
+        fi
+    fi
+done
+
+echo "Imagick SVG support configured"
+
+sudo systemctl restart apache2
+
+# Clear initial installation logs
+echo "Clearing installation logs..."
+if [ -f "/var/www/$HOSTNAME/data/nextcloud.log" ]; then
+    truncate -s 0 /var/www/$HOSTNAME/data/nextcloud.log
+    chown www-data:www-data /var/www/$HOSTNAME/data/nextcloud.log
+    echo "Nextcloud logs cleared"
+fi
+
+# 23. Clean up
+echo ""
+echo "Do you want to delete the Nextcloud zip file (latest.zip)? (y/n)"
+read -r cleanup_choice
+
+if [[ "$cleanup_choice" =~ ^[Yy]$ ]]; then
+    echo "Cleaning up..."
+    rm -f latest.zip
+    echo "Cleanup completed"
+else
+    echo "Keeping latest.zip for future use..."
+fi
+sudo -u www-data php /var/www/nextcloud.home.local/occ db:add-missing-indices
+sudo systemctl restart apache2
+
+echo ""
+echo "===== Nextcloud Installation Complete ====="
+echo ""
+echo "IMPORTANT: DNS/Hosts File Configuration"
+echo "=========================================="
+echo "To access Nextcloud via hostname, you need to configure DNS or hosts file:"
+echo ""
+echo "Option 1 - Add to your DNS server (pfSense, Pi-hole, etc.):"
+echo "  Host: nextcloud.home.local"
+echo "  IP: $SERVER_IP"
+echo ""
+echo "Option 2 - Add to your computer's hosts file:"
+echo "  Windows: C:\\Windows\\System32\\drivers\\etc\\hosts"
+echo "  Mac/Linux: /etc/hosts"
+echo "  Add this line:"
+echo "  $SERVER_IP    $HOSTNAME"
+echo ""
+echo "=========================================="
+echo ""
+echo "You can access Nextcloud at:"
+echo "  - http://$SERVER_IP (works now)"
+echo "  - http://$HOSTNAME (after DNS/hosts configuration)"
+if [[ "$ssl_choice" =~ ^[Yy]$ ]]; then
+    echo "  - https://$HOSTNAME (SSL enabled - requires DNS)"
+fi
+echo ""
+echo "Admin username: $ADMIN_USER"
+echo "Admin password: $ADMIN_PASSWORD"
+echo ""
+echo "Configured Features:"
+echo "  ✓ MariaDB database"
+echo "  ✓ APCu memory cache"
+echo "  ✓ Cron background jobs (runs every 5 minutes)"
+echo "  ✓ Imagick with SVG support"
+echo "  ✓ Trusted domains configured"
+echo "  ✓ Installation logs cleared"
+echo ""
+echo "Important security notes:"
+echo "1. Change the default admin password after first login"
+echo "2. Consider changing the database password in the config.php file"
+echo "3. Configure a firewall to protect your server"
+echo "4. Set up SSL/HTTPS for production use"
+echo ""
+echo "To add more trusted domains later, use:"
+echo "  sudo -u www-data php /var/www/$HOSTNAME/occ config:system:set trusted_domains 3 --value=\"your.domain.com\""
+echo "====================================================="
+
